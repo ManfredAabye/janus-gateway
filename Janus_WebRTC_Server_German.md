@@ -1,56 +1,65 @@
 # Janus WebRTC Server direkt auf Ubuntu 24 Server installieren
 
-## 1. Abhängigkeiten installieren
+# Ein Beispielskript, das alle notwendigen Schritte umfasst
 
-Öffne das Terminal und führe die folgenden Befehle aus, um die erforderlichen Abhängigkeiten zu installieren:
+## Bash-Skript zur Installation von Janus WebRTC Server auf Ubuntu
 
 ```bash
+
+#!/bin/bash
+
+# Update und Installieren der Abhängigkeiten
 sudo apt update
-sudo apt install build-essential pkg-config zlib1g-dev libssl-dev libjansson-dev libnice-dev libsrtp0-dev libmicrohttpd-dev libwebsockets-dev cmake
-```
+sudo apt install -y build-essential pkg-config zlib1g-dev libssl-dev libjansson-dev libnice-dev libsrtp2-dev libmicrohttpd-dev libwebsockets-dev cmake libsofia-sip-ua-dev libglib2.0-dev libopus-dev libogg-dev libcurl4-openssl-dev liblua5.3-dev libconfig-dev libtool automake
 
-## 2. Janus-Quellcode herunterladen und kompilieren
-
-Lade den Janus-Quellcode von GitHub herunter:
-
-```bash
+# Janus-Quellcode herunterladen und kompilieren
 git clone https://github.com/meetecho/janus-gateway.git
-cd janus-gateway
-```
-
-Führe die folgenden Befehle aus, um Janus zu kompilieren:
-
-```bash
-
-./autogen.sh
-./configure
+cd janus-gateway || exit
+sh autogen.sh
+./configure --prefix=/opt/janus
 make
 sudo make install
-```
 
-## 3. Janus starten
-
-Starte den Janus-Server mit dem folgenden Befehl:
-
-```bash
-sudo janus
-```
-
-## 4. Plugins installieren und konfigurieren
-
-Lade die benötigten Plugins herunter und installiere sie:
-
-```bash
+# Plugins installieren und konfigurieren
+cd ..
 git clone https://github.com/meetecho/janus-plugin-echo.git
-cd janus-plugin-echo
-./autogen.sh
-./configure
+cd janus-plugin-echo || exit
+sh autogen.sh
+./configure --prefix=/opt/janus
 make
 sudo make install
+
+# Janus starten
+sudo /opt/janus/bin/janus
+
 ```
 
-Konfiguriere die Plugins nach Bedarf.
+## Erläuterungen zum Skript
 
-## 5. Janus überprüfen
+1. **Update und Installieren der Abhängigkeiten**:
+   - Das Skript aktualisiert die Paketlisten und installiert alle notwendigen Abhängigkeiten für die Janus-Installation.
 
-Öffne einen Webbrowser und gehe zu `http://localhost:8088` (oder der entsprechenden IP-Adresse und Portnummer), um sicherzustellen, dass der Janus-Server läuft und die Plugins korrekt installiert sind.
+2. **Janus-Quellcode herunterladen und kompilieren**:
+   - Es wird der Janus-Quellcode von GitHub heruntergeladen und kompiliert. Dabei wird `--prefix=/opt/janus` verwendet, um Janus im `/opt/janus` Verzeichnis zu installieren.
+
+3. **Plugins installieren und konfigurieren**:
+   - Es wird das Echo-Plugin heruntergeladen, kompiliert und installiert.
+
+4. **Janus starten**:
+   - Der Janus-Server wird gestartet.
+
+## Ausführen des Skripts
+
+1. Speichere das Skript in eine Datei, z.B. `install_janus.sh`.
+2. Mache die Datei ausführbar:
+
+   ```bash
+   chmod +x install_janus.sh
+   ```
+
+3. Führe das Skript aus:
+
+   ```bash
+   bash install_janus.sh
+   ```
+
