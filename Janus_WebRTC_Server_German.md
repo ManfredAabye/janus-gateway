@@ -1,6 +1,4 @@
-# Ein Beispielskript, das alle notwendigen Schritte umfasst
-
-## Bash-Skript zur Installation von Janus WebRTC Server auf Ubuntu Server 24.04
+# Bash-Skript zur Installation von Janus WebRTC Server auf Ubuntu Server 24.04
 
 ```bash
 #!/bin/bash
@@ -41,9 +39,9 @@ Speichere das Skript in eine Datei, z.B. `install_janus.sh`.
 
 Führe das Skript aus:
 
-   ```bash
-   bash install_janus.sh
-   ```
+```bash
+bash install_janus.sh
+```
 
 Das `janus_echotest.c` Plugin ist tatsächlich Teil der Janus-Plattform und sollte mit der normalen Installation von Janus bereits vorhanden sein.
 Es scheint, dass es eine Verwechslung zwischen dem normalen `janus_echotest` Plugin und dem `janus-plugin-echo` gibt.
@@ -274,7 +272,7 @@ transports: [
 ]
 ```
 
-### Fazit
+## Fazit
 
 Mit diesen Schritten sollten die Fehler behoben werden und der Janus-Server korrekt starten und laufen.
 
