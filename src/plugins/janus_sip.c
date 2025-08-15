@@ -36,8 +36,8 @@
  * as events with the same transaction.
  *
  * The supported requests are \c register , \c unregister , \c call ,
- * \progress , \c accept , \c decline , \c info , \c message , \c dtmf_info ,
- * \c subscribe , \c unsubscribe , \c transfer , \c recording ,
+ * \c progress , \c accept , \c decline , \c info , \c message , \c dtmf_info ,
+ * \c subscribe , \c unsubscribe , \c transfer , \c recording , \c keyframe ,
  * \c hold , \c unhold , \c update and \c hangup . \c register can be used,
  * as the name suggests, to register a username at a SIP registrar to
  * call and be called, while \c unregister unregisters it; \c call is used
@@ -85,7 +85,8 @@
 		"reason" : "<SIP error reason>",
 		"reason_header" : "<Reason header text; optional>",
 		"reason_header_protocol" : "<Reason header protocol; optional>",
-		"reason_header_cause" : "<Reason header cause code; optional>"
+		"reason_header_cause" : "<Reason header cause code; optional>",
+		"headers" : "<object with key/value strings; custom headers extracted from SIP event based on incoming_header_prefix defined in register request; optional>"
 	}
 }
 \endverbatim
@@ -115,6 +116,7 @@
 	"force_tcp" : <true|false; if true, forces TCP for the SIP messaging; optional>,
 	"sips" : <true|false; if true, configures a SIPS URI too when registering; optional>,
 	"rfc2543_cancel" : <true|false; if true, configures sip client to CANCEL pending INVITEs without having received a provisional response first; optional>,
+	"automatic_ringing" : <true|false; if false, don't generate ringing automatically as soon as an INVITE; optional>,
 	"username" : "<SIP URI to register; mandatory>",
 	"secret" : "<password to use to register; optional>",
 	"ha1_secret" : "<prehashed password to use to register; optional>",
@@ -566,6 +568,28 @@
  *
  * A \c recordingupdated event is sent back in case the request is successful.
  *
+ * To programmatically send a video keyframe request to either the WebRTC user
+ * or the SIP peer (or both), the \c keyframe request can be used. This
+ * request is particularly useful when the SIP peer doesn't support RTCP PLI,
+ * and so may use other mechanisms (e.g., via signalling) to ask for a keyframe
+ * to get video working. By using this request, the WebRTC user can ask Janus
+ * to originate a PLI programmatically. The direction of the keyframe request
+ * can be provided by using the \c user and \c peer properties: if \c user
+ * is \c TRUE a keyframe request will be sent by Janus to the WebRTC user;
+ * if \c peer is \c TRUE a keyframe request will be sent by Janus to the
+ * SIP peer. In both cases an RTCP PLI message will be sent. The syntax of
+ * the message is the following:
+ *
+\verbatim
+{
+	"request" : "keyframe",
+	"user" : <true|false; whether or not to send a keyframe request to the WebRTC user>,
+	"peer" : <true|false; whether or not to send a keyframe request to the SIP peer>
+}
+\endverbatim
+ *
+ * A \c keyframesent event is sent back in case the request is successful.
+ *
  * \section sipmc Simultaneous SIP calls using the same account
  *
  * As anticipated in the previous sections, attaching to the SIP plugin
@@ -786,6 +810,7 @@ static struct janus_json_parameter register_parameters[] = {
 	{"force_tcp", JANUS_JSON_BOOL, 0},
 	{"sips", JANUS_JSON_BOOL, 0},
 	{"rfc2543_cancel", JANUS_JSON_BOOL, 0},
+	{"automatic_ringing", JANUS_JSON_BOOL, 0},
 	{"username", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
 	{"secret", JSON_STRING, 0},
 	{"ha1_secret", JSON_STRING, 0},
@@ -872,6 +897,10 @@ static struct janus_json_parameter sipmessage_parameters[] = {
 	{"uri", JSON_STRING, 0},
 	{"headers", JSON_OBJECT, 0},
 	{"call_id", JANUS_JSON_STRING, 0}
+};
+static struct janus_json_parameter keyframe_parameters[] = {
+	{"user", JANUS_JSON_BOOL, 0},
+	{"peer", JANUS_JSON_BOOL, 0}
 };
 
 /* Useful stuff */
@@ -1021,6 +1050,7 @@ typedef struct janus_sip_account {
 	gboolean force_tcp;
 	gboolean sips;
 	gboolean rfc2543_cancel;
+	gboolean automatic_ringing;
 	char *username;
 	char *display_name;		/* Used for outgoing calls in the From header */
 	char *authuser;			/**< username to use for authentication */
@@ -1115,6 +1145,7 @@ typedef struct janus_sip_session {
 	char *hangup_reason_header_protocol;
 	char *hangup_reason_header_cause;
 	GList *incoming_header_prefixes;
+	json_t *hangup_custom_headers;
 	GList *active_calls;
 	janus_refcount ref;
 	janus_sip_dtmf latest_dtmf;
@@ -1196,6 +1227,7 @@ static void janus_sip_session_free(const janus_refcount *session_ref) {
 		su_home_deinit(session->stack->s_home);
 		su_home_unref(session->stack->s_home);
 		g_free(session->stack->contact_header);
+		janus_mutex_destroy(&session->stack->smutex);
 		g_free(session->stack);
 		session->stack = NULL;
 	}
@@ -1271,7 +1303,13 @@ static void janus_sip_session_free(const janus_refcount *session_ref) {
 		g_list_free_full(session->incoming_header_prefixes, g_free);
 		session->incoming_header_prefixes = NULL;
 	}
+	if(session->hangup_custom_headers) {
+		json_decref(session->hangup_custom_headers);
+		session->hangup_custom_headers = NULL;
+	}
 	janus_sip_srtp_cleanup(session);
+	janus_mutex_destroy(&session->mutex);
+	janus_mutex_destroy(&session->rec_mutex);
 	g_free(session);
 }
 
@@ -1624,8 +1662,7 @@ static json_t *janus_sip_get_incoming_headers(const sip_t *sip, const janus_sip_
 			char *header_prefix = (char *)temp->data;
 			if(header_prefix != NULL && unknown_header->un_name != NULL) {
 				if(strncasecmp(unknown_header->un_name, header_prefix, strlen(header_prefix)) == 0) {
-					const char *header_name = g_strdup(unknown_header->un_name);
-					json_object_set(headers, header_name, json_string(unknown_header->un_value));
+					json_object_set(headers, unknown_header->un_name, json_string(unknown_header->un_value));
 					break;
 				}
 			}
@@ -1800,7 +1837,7 @@ static void janus_sip_sofia_logger_siptrace_callback(void *stream, char const *f
 	/* Since the fmt format string in the current Sofia SIP tport_log_msg function implementation is just "%s\n",
 	 * it's more efficient to directly work with the siptrace buffer. */
 	char *buffer = va_arg(ap, char *);
-	g_print(" >>> %s\n", buffer);
+	JANUS_LOG(LOG_HUGE, " >>> %s\n", buffer);
 
 	/* Check if this is a message we need */
 	if(strstr(buffer, "send ") == buffer) {
@@ -2294,6 +2331,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->account.force_tcp = FALSE;
 	session->account.sips = FALSE;
 	session->account.rfc2543_cancel = FALSE;
+	session->account.automatic_ringing = TRUE;
 	session->account.username = NULL;
 	session->account.display_name = NULL;
 	session->account.user_agent = NULL;
@@ -2313,6 +2351,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->hangup_reason_header = NULL;
 	session->hangup_reason_header_protocol = NULL;
 	session->hangup_reason_header_cause = NULL;
+	session->hangup_custom_headers = NULL;
 	session->media.remote_audio_ip = NULL;
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
@@ -3104,6 +3143,11 @@ static void *janus_sip_handler(void *data) {
 			if(do_rfc2543_cancel != NULL) {
 				rfc2543_cancel = json_is_true(do_rfc2543_cancel);
 			}
+			gboolean automatic_ringing = TRUE;
+			json_t *do_automatic_ringing = json_object_get(root, "automatic_ringing");
+			if(do_automatic_ringing != NULL) {
+				automatic_ringing = json_is_true(do_automatic_ringing);
+			}
 
 			/* Parse addresses */
 			json_t *proxy = json_object_get(root, "proxy");
@@ -3261,6 +3305,7 @@ static void *janus_sip_handler(void *data) {
 				session->account.force_tcp = FALSE;
 				session->account.sips = FALSE;
 				session->account.rfc2543_cancel = FALSE;
+				session->account.automatic_ringing = TRUE;
 				if(session->account.username != NULL)
 					g_free(session->account.username);
 				session->account.username = NULL;
@@ -3293,6 +3338,7 @@ static void *janus_sip_handler(void *data) {
 			session->account.force_tcp = force_tcp;
 			session->account.sips = sips;
 			session->account.rfc2543_cancel = rfc2543_cancel;
+			session->account.automatic_ringing = automatic_ringing;
 			session->account.username = g_strdup(user_id);
 			session->account.authuser = g_strdup(authuser_text ? authuser_text : user_id);
 			session->account.secret = secret_text ? g_strdup(secret_text) : NULL;
@@ -4918,6 +4964,14 @@ static void *janus_sip_handler(void *data) {
 			/* Notify the operation */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("infosent"));
+		} else if(!strcasecmp(request_text, "send_ringing")) {
+			if(session->status != janus_sip_call_status_invited && session->status != janus_sip_call_status_progress) {
+				JANUS_LOG(LOG_ERR, "Wrong state (not invited or progress? status=%s)\n", janus_sip_call_status_string(session->status));
+				g_snprintf(error_cause, 512, "Wrong state (not in a call?)");
+				goto error;
+			}
+			if(session->stack->s_nh_i)
+				nua_respond(session->stack->s_nh_i, 180, sip_status_phrase(180), TAG_END());
 		} else if(!strcasecmp(request_text, "message")) {
 			/* Send a SIP MESSAGE request: we'll only need the content and optional payload type */
 			JANUS_VALIDATE_JSON_OBJECT(root, sipmessage_parameters,
@@ -5096,6 +5150,42 @@ static void *janus_sip_handler(void *data) {
 			/* Notify the result */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("dtmfsent"));
+		} else if(!strcasecmp(request_text, "keyframe")) {
+			/* Programmatically send a keyframe request via RTCP PLI to
+			 * either the WebRTC user, the SIP peer, or both of them */
+			if(!janus_sip_call_is_established(session)) {
+				JANUS_LOG(LOG_ERR, "Wrong state (not established? status=%s)\n", janus_sip_call_status_string(session->status));
+				g_snprintf(error_cause, 512, "Wrong state (not in a call?)");
+				goto error;
+			}
+			janus_mutex_lock(&session->mutex);
+			if(session->callee == NULL) {
+				janus_mutex_unlock(&session->mutex);
+				JANUS_LOG(LOG_ERR, "Wrong state (no callee?)\n");
+				error_code = JANUS_SIP_ERROR_WRONG_STATE;
+				g_snprintf(error_cause, 512, "Wrong state (no callee?)");
+				goto error;
+			}
+			janus_mutex_unlock(&session->mutex);
+			JANUS_VALIDATE_JSON_OBJECT(root, keyframe_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_SIP_ERROR_MISSING_ELEMENT, JANUS_SIP_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+			gboolean user = json_is_true(json_object_get(root, "user"));
+			gboolean peer = json_is_true(json_object_get(root, "peer"));
+			if(user) {
+				/* Send a PLI to the WebRTC user */
+				gateway->send_pli(session->handle);
+			}
+			if(peer) {
+				/* Send a PLI to the SIP peer (but only if they negotiated it) */
+				if(session->media.video_pli_supported)
+					janus_sip_rtcp_pli_send(session);
+			}
+			/* Notify the result */
+			result = json_object();
+			json_object_set_new(result, "event", json_string("keyframesent"));
 		} else if(!strcasecmp(request_text, "reset")) {
 			/* Apparently, under some particular circumstances that we haven't
 			 * managed to replicate ourselves yet, it can sometimes happen that
@@ -5243,6 +5333,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					json_object_set_new(calling, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
 				if(session->hangup_reason_header_cause)
 					json_object_set_new(calling, "reason_header_cause", json_string(session->hangup_reason_header_cause));
+				if(session->hangup_custom_headers) {
+					json_t *custom_headers_copy = json_deep_copy(session->hangup_custom_headers);
+					json_object_set_new(calling, "headers", custom_headers_copy);
+				}
 				json_object_set_new(call, "result", calling);
 				json_object_set_new(call, "call_id", json_string(session->callid));
 				int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, call, NULL);
@@ -5263,6 +5357,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						json_object_set_new(info, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
 					if(session->hangup_reason_header_cause)
 						json_object_set_new(info, "reason_header_cause", json_string(session->hangup_reason_header_cause));
+					if(session->hangup_custom_headers) {
+						json_t *custom_headers_notify_copy = json_deep_copy(session->hangup_custom_headers);
+						json_object_set_new(info, "headers", custom_headers_notify_copy);
+					}
 					gateway->notify_event(&janus_sip_plugin, session->handle, info);
 				}
 				/* Get rid of any PeerConnection that may have been set up */
@@ -5289,6 +5387,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				session->hangup_reason_header = NULL;
 				session->hangup_reason_header_protocol = NULL;
 				session->hangup_reason_header_cause = NULL;
+				if(session->hangup_custom_headers) {
+					json_decref(session->hangup_custom_headers);
+					session->hangup_custom_headers = NULL;
+				}
 				if(g_atomic_int_get(&session->establishing) || g_atomic_int_get(&session->established)) {
 					/* Get rid of the PeerConnection in the core */
 					gateway->close_pc(session->handle);
@@ -5579,8 +5681,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			su_free(session->stack->s_home, callee_text);
 			g_free(referred_by);
 			if(!reinvite) {
-				/* Send a Ringing back */
-				nua_respond(nh, 180, sip_status_phrase(180), TAG_END());
+				if(session->account.automatic_ringing) {
+					/* Send a Ringing back */
+					nua_respond(nh, 180, sip_status_phrase(180), TAG_END());
+				}
 				session->stack->s_nh_i = nh;
 			}
 			break;
@@ -6339,6 +6443,7 @@ auth_failed:
 				session->account.force_tcp = FALSE;
 				session->account.sips = FALSE;
 				session->account.rfc2543_cancel = FALSE;
+				session->account.automatic_ringing = TRUE;
 				if(session->account.username != NULL)
 					g_free(session->account.username);
 				session->account.username = NULL;
@@ -6515,6 +6620,13 @@ void janus_sip_save_reason(sip_t const *sip, janus_sip_session *session) {
 	if(sip->sip_reason && sip->sip_reason->re_cause) {
 		g_free(session->hangup_reason_header_cause);
 		session->hangup_reason_header_cause = g_strdup(sip->sip_reason->re_cause);
+	}
+	if(session->incoming_header_prefixes) {
+		if(session->hangup_custom_headers) {
+			json_decref(session->hangup_custom_headers);
+		}
+		json_t *headers = janus_sip_get_incoming_headers(sip, session);
+		session->hangup_custom_headers = headers;
 	}
 }
 
@@ -7686,8 +7798,8 @@ static void janus_sip_rtcp_pli_send(janus_sip_session *session) {
 	int rtcp_len = 12;
 	janus_rtcp_pli((char *)&rtcp_buf, rtcp_len);
 	/* Fix SSRCs as the Janus core does */
-	JANUS_LOG(LOG_HUGE, "[SIP] Fixing SSRCs (local %u, peer %u)\n",
-		session->media.video_ssrc, session->media.video_ssrc_peer);
+	JANUS_LOG(LOG_HUGE, "[SIP-%s] Fixing SSRCs (local %u, peer %u)\n",
+		session->account.username, session->media.video_ssrc, session->media.video_ssrc_peer);
 	janus_rtcp_fix_ssrc(NULL, (char *)rtcp_buf, rtcp_len, 1, session->media.video_ssrc, session->media.video_ssrc_peer);
 	/* Is SRTP involved? */
 	if(session->media.has_srtp_local_video) {

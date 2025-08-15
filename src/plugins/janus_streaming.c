@@ -1239,6 +1239,7 @@ static janus_mutex config_mutex = JANUS_MUTEX_INITIALIZER;
 static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
 static gboolean string_ids = FALSE;
+static gboolean ipv6_disabled = FALSE;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static void *janus_streaming_handler(void *data);
@@ -1498,6 +1499,7 @@ static void janus_streaming_helper_free(const janus_refcount *helper_ref) {
 	g_async_queue_unref(helper->queued_packets);
 	if(helper->viewers != NULL)
 		g_list_free(helper->viewers);
+	janus_mutex_destroy(&helper->mutex);
 	g_free(helper);
 }
 static void *janus_streaming_helper_thread(void *data);
@@ -1596,6 +1598,7 @@ static void janus_streaming_session_free(const janus_refcount *session_ref) {
 	/* Remove the reference to the core plugin session */
 	janus_refcount_decrease(&session->handle->ref);
 	/* This session can be destroyed, free all the resources */
+	janus_mutex_destroy(&session->mutex);
 	g_free(session);
 }
 
@@ -1635,7 +1638,6 @@ static void janus_streaming_mountpoint_destroy(janus_streaming_mountpoint *mount
 static void janus_streaming_mountpoint_free(const janus_refcount *mp_ref) {
 	janus_streaming_mountpoint *mp = janus_refcount_containerof(mp_ref, janus_streaming_mountpoint, ref);
 	/* This mountpoint can be destroyed, free all the resources */
-
 	g_free(mp->id_str);
 	g_free(mp->name);
 	g_free(mp->description);
@@ -1657,11 +1659,10 @@ static void janus_streaming_mountpoint_free(const janus_refcount *mp_ref) {
 		g_list_free(mp->threads);
 	}
 	janus_mutex_unlock(&mp->mutex);
-
 	if(mp->source != NULL && mp->source_destroy != NULL) {
 		mp->source_destroy(mp->source);
 	}
-
+	janus_mutex_destroy(&mp->mutex);
 	g_free(mp);
 }
 
@@ -1994,6 +1995,21 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	config_folder = config_path;
 	if(config != NULL)
 		janus_config_print(config);
+
+	/* Let's check if IPv6 is disabled, as we may need when creating sockets */
+	int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if(fd < 0) {
+		ipv6_disabled = TRUE;
+	} else {
+		int v6only = 0;
+		if(setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0)
+			ipv6_disabled = TRUE;
+	}
+	if(fd >= 0)
+		close(fd);
+	if(ipv6_disabled) {
+		JANUS_LOG(LOG_WARN, "IPv6 disabled, will only use IPv4 sockets for mountpoints\n");
+	}
 
 	/* Threads will expect this to be set */
 	g_atomic_int_set(&initialized, 1);
@@ -5382,7 +5398,7 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			if (stop_rec) {
 				stop_recording = json_is_true(stop_rec);
 			}
-			JANUS_LOG(LOG_INFO, "[%s] Stream disabled (stop_recording=%s)\n", mp->name, stop_recording ? "yes" : "no");
+			JANUS_LOG(LOG_INFO, "[%s] Stream disabled (stop_recording=%s)\n", mp->name, stop_recording ? "true" : "false");
 			/* Any recording to close? */
 			if(mp->streaming_source == janus_streaming_source_rtp && stop_recording) {
 				janus_streaming_rtp_source *source = mp->source;
@@ -7120,6 +7136,14 @@ done:
 			janus_mutex_unlock(&sessions_mutex);
 			if(g_atomic_int_get(&session->stopping) || !g_atomic_int_get(&session->started)) {
 				/* Been there, done that: ignore */
+				json_t *event = json_object();
+				json_object_set_new(event, "streaming", json_string("event"));
+				result = json_object();
+				json_object_set_new(result, "status", json_string("idle"));
+				json_object_set_new(event, "result", result);
+				int ret = gateway->push_event(msg->handle, &janus_streaming_plugin, msg->transaction, event, NULL);
+				JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+				json_decref(event);
 				janus_streaming_message_free(msg);
 				continue;
 			}
@@ -7203,7 +7227,8 @@ static int janus_streaming_create_fd(int port, in_addr_t mcast, const janus_netw
 
 	int fd = -1, family = 0;
 	while(1) {
-		family = 0;	/* By default, we bind to both IPv4 and IPv6 */
+		/* By default, we bind to both IPv4 and IPv6, unless IPv6 is disabled */
+		family = ipv6_disabled ? AF_INET : 0;
 		if(use_range && rtp_port_wrap && rtp_port_next >= rtp_port_start) {
 			/* Full range scanned */
 			JANUS_LOG(LOG_ERR, "No ports available for RTP/RTCP in range: %u -- %u\n",
@@ -7300,6 +7325,10 @@ static int janus_streaming_create_fd(int port, in_addr_t mcast, const janus_netw
 					if(host && hostlen > 0)
 						g_strlcpy(host, janus_network_address_string_from_buffer(&address_representation), hostlen);
 				} else if(iface->family == AF_INET6) {
+					if(ipv6_disabled) {
+						JANUS_LOG(LOG_ERR, "[%s] Can't bind to IPv6 address, IPv6 is disabled\n", mountpointname);
+						continue;
+					}
 					memcpy(&address6.sin6_addr, &iface->ipv6, sizeof(iface->ipv6));
 					(void) janus_network_address_to_string_buffer(iface, &address_representation); /* This is OK: if we get here iface must be non-NULL */
 					JANUS_LOG(LOG_INFO, "[%s] %s listener restricted to interface address: %s\n",
@@ -7436,6 +7465,10 @@ static void janus_streaming_rtp_source_stream_free(const janus_refcount *st_ref)
 	g_free(stream->mstid);
 	g_free(stream->mcast_str);
 	g_free(stream->iface_str);
+	if(stream->rc != NULL) {
+		janus_recorder_close(stream->rc);
+		janus_recorder_destroy(stream->rc);
+	}
 	g_free(stream);
 }
 
@@ -7478,10 +7511,12 @@ static void janus_streaming_rtp_source_free(gpointer data) {
 	g_free(source->rtsp_vhost);
 	g_free(source->rtsp_vcodecs.fmtp);
 	janus_mutex_unlock(&source->rtsp_mutex);
+	janus_mutex_destroy(&source->rtsp_mutex);
 #endif
 	g_list_free_full(source->media, (GDestroyNotify)(janus_streaming_rtp_source_stream_unref));
 	g_hash_table_unref(source->media_byid);
 	g_hash_table_unref(source->media_byfd);
+	janus_mutex_destroy(&source->rec_mutex);
 	g_free(source);
 }
 
