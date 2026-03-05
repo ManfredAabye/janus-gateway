@@ -1,0 +1,45 @@
+From 3d933d01d2ccb2429f9a6e71502e5a65657042d7 Mon Sep 17 00:00:00 2001
+From: Manfred Aabye <zainhofer@gmx.de>
+Date: Thu, 5 Mar 2026 12:02:32 +0100
+Subject: [PATCH] unused variable
+
+---
+ src/plugins/janus_streaming.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/plugins/janus_streaming.c b/src/plugins/janus_streaming.c
+index 3b8fce16a4..5dd00869fc 100644
+--- a/src/plugins/janus_streaming.c
++++ b/src/plugins/janus_streaming.c
+@@ -3781,7 +3781,10 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
+ 				/* If we got here, we create a mountpoint the "old" way */
+ 				legacy = TRUE;
+ 				JANUS_LOG(LOG_WARN, "Deprecated mountpoint 'create' API: please start looking into the new one for the future\n");
+-				janus_network_address audio_iface, video_iface, data_iface;
++				janus_network_address audio_iface, video_iface;
++#ifdef HAVE_SCTP
++				janus_network_address data_iface;
++#endif
+ 				json_t *audio = json_object_get(root, "audio");
+ 				json_t *video = json_object_get(root, "video");
+ 				json_t *data = json_object_get(root, "data");
+@@ -3963,9 +3966,6 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
+ 					/* Add to the list of streams */
+ 					streams = g_list_append(streams, stream);
+ 				}
+-				uint16_t dport = 0;
+-				gboolean textdata = TRUE, buffermsg = FALSE;
+-				char *dmcast = NULL, *dmiface = NULL;
+ 				if(dodata) {
+ 					JANUS_VALIDATE_JSON_OBJECT(root, rtp_data_parameters,
+ 						error_code, error_cause, TRUE,
+@@ -3978,6 +3978,9 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
+ 						goto prepare_response;
+ 					}
+ #ifdef HAVE_SCTP
++					uint16_t dport = 0;
++					gboolean textdata = TRUE, buffermsg = FALSE;
++					char *dmcast = NULL, *dmiface = NULL;
+ 					json_t *datamcast = json_object_get(root, "datamcast");
+ 					dmcast = (char *)json_string_value(datamcast);
+ 					json_t *dataport = json_object_get(root, "dataport");
