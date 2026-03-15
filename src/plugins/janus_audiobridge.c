@@ -533,6 +533,7 @@ room-<unique room ID>: {
 			"suspended" : <true|false, whether user is suspended or not>,
 			"talking" : <true|false, whether user is talking or not (only if audio levels are used)>,
 			"spatial_position" : <in case spatial audio is used, the panning of this participant (0=left, 50=center, 100=right)>,
+			"spatial_position_fb" : <in case spatial audio is used, the front/rear positioning of this participant (0=rear, 50=center, 100=front)>,
 		},
 		// Other participants
 	]
@@ -899,6 +900,7 @@ room-<unique room ID>: {
 	"expected_loss" : <0-20, a percentage of the expected loss (capped at 20%), only needed in case outgoing FEC is used; optional, default is 0 (FEC disabled even when negotiated) or the room default>,
 	"volume" : <percent value, <100 reduces volume, >100 increases volume; optional, default is 100 (no volume change)>,
 	"spatial_position" : <in case spatial audio is enabled for the room, panning of this participant (0=left, 50=center, 100=right)>,
+	"spatial_position_fb" : <in case spatial audio is enabled for the room, front/rear positioning of this participant (0=rear, 50=center, 100=front), optional, default=100>,
 	"denoise" : <true|false, whether denoising via RNNoise should be performed for this participant (default=room value)>,
 	"secret" : "<room management password; optional, if provided the user is an admin and can't be globally muted with mute_room>",
 	"audio_level_average" : "<if provided, overrides the room audio_level_average for this user; optional>",
@@ -991,6 +993,7 @@ room-<unique room ID>: {
 	"expected_loss" : <new value for the expected loss (see "join" for more info)>
 	"volume" : <new volume percent value (see "join" for more info)>,
 	"spatial_position" : <in case spatial audio is enabled for the room, new panning of this participant (0=left, 50=center, 100=right)>,
+	"spatial_position_fb" : <in case spatial audio is enabled for the room, new front/rear positioning of this participant (0=rear, 50=center, 100=front)>,
 	"denoise" : <true|false, whether denoising via RNNoise should be performed for this participant (default=room value)>,
 	"record": <true|false, whether to record this user's contribution to a .mjr file (mixer not involved),
 	"filename": "<basename of the file to record to, -audio.mjr will be added by the plugin; will be relative to mjrs_dir, if configured in the room>",
@@ -1107,6 +1110,7 @@ room-<unique room ID>: {
 	"expected_loss" : <0-20, a percentage of the expected loss (capped at 20%), only needed in case outgoing FEC is used; optional, default is 0 (FEC disabled even when negotiated) or the room default>,
 	"volume" : <new volume percent value (see "join" for more info)>,
 	"spatial_position" : <in case spatial audio is enabled for the room, new panning of this participant (0=left, 50=center, 100=right)>,
+	"spatial_position_fb" : <in case spatial audio is enabled for the room, new front/rear positioning of this participant (0=rear, 50=center, 100=front)>,
 	"denoise" : <true|false, whether denoising via RNNoise should be performed for this participant (default=room value, or whether it was active before)>
 }
 \endverbatim
@@ -1399,6 +1403,7 @@ static struct janus_json_parameter join_parameters[] = {
 	{"expected_loss", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"volume", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"spatial_position", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"spatial_position_fb", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_level_average", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_active_packets", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"denoise", JANUS_JSON_BOOL, 0},
@@ -1432,6 +1437,7 @@ static struct janus_json_parameter configure_parameters[] = {
 	{"volume", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"group", JSON_STRING, 0},
 	{"spatial_position", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"spatial_position_fb", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"denoise", JANUS_JSON_BOOL, 0},
 	{"record", JANUS_JSON_BOOL, 0},
 	{"filename", JSON_STRING, 0},
@@ -1770,6 +1776,7 @@ typedef struct janus_audiobridge_participant {
 	int opus_complexity;	/* Complexity to use in the encoder (by default, DEFAULT_COMPLEXITY) */
 	gboolean stereo;		/* Whether stereo will be used for spatial audio */
 	int spatial_position;	/* Panning of this participant in the mix */
+	int spatial_position_fb;	/* Front/rear position of this participant in the mix */
 #ifdef HAVE_RNNOISE
 #define DENOISER_FRAME_SIZE 480
 	gboolean denoise;					/* Whether we should denoise this participant */
@@ -1893,6 +1900,16 @@ static void janus_audiobridge_participant_clear_outbuf(janus_audiobridge_partici
 	}
 }
 
+/* Apply a mild low-pass tilt for rear sources to improve front/rear perception in stereo. */
+static inline opus_int16 janus_audiobridge_rear_tone(opus_int16 sample, const opus_int16 *buffer, int index, int rear_mix) {
+	if(rear_mix <= 0 || buffer == NULL)
+		return sample;
+	int prev = index >= 2 ? buffer[index-2] : sample;
+	int filtered = (sample + prev) / 2;
+	int out = ((sample * (100 - rear_mix)) + (filtered * rear_mix)) / 100;
+	return (opus_int16)out;
+}
+
 static void janus_audiobridge_participant_destroy(janus_audiobridge_participant *participant) {
 	if(!participant)
 		return;
@@ -1953,8 +1970,6 @@ static void janus_audiobridge_participant_free(const janus_refcount *participant
 	janus_mutex_destroy(&participant->pmutex);
 	janus_mutex_destroy(&participant->qmutex);
 	janus_mutex_destroy(&participant->rec_mutex);
-	janus_mutex_destroy(&participant->suspend_cond_mutex);
-	janus_condition_destroy(&participant->suspend_cond);
 	g_free(participant);
 }
 
@@ -3120,8 +3135,10 @@ json_t *janus_audiobridge_query_session(janus_plugin_session *handle) {
 		janus_mutex_unlock(&participant->qmutex);
 		if(participant->outbuf)
 			json_object_set_new(info, "queue-out", json_integer(g_async_queue_length(participant->outbuf)));
-		if(participant->stereo)
+		if(participant->stereo) {
 			json_object_set_new(info, "spatial_position", json_integer(participant->spatial_position));
+			json_object_set_new(info, "spatial_position_fb", json_integer(participant->spatial_position_fb));
+		}
 #ifdef HAVE_RNNOISE
 		json_object_set_new(info, "denoise",  participant->denoise ? json_true() : json_false());
 #endif
@@ -4372,8 +4389,10 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 			json_object_set_new(pl, "display", json_string(participant->display));
 		json_object_set_new(pl, "setup", g_atomic_int_get(&participant->session->started) ? json_true() : json_false());
 		json_object_set_new(pl, "muted", participant->muted ? json_true() : json_false());
-		if(audiobridge->spatial_audio)
+		if(audiobridge->spatial_audio) {
 			json_object_set_new(pl, "spatial_position", json_integer(participant->spatial_position));
+			json_object_set_new(pl, "spatial_position_fb", json_integer(participant->spatial_position_fb));
+		}
 		if(g_atomic_int_get(&participant->suspended))
 			json_object_set_new(pl, "suspended", json_true());
 		json_array_append_new(list, pl);
@@ -4880,8 +4899,10 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 			json_object_set_new(pl, "muted", p->muted ? json_true() : json_false());
 			if(p->extmap_id > 0)
 				json_object_set_new(pl, "talking", p->talking ? json_true() : json_false());
-			if(audiobridge->spatial_audio)
+			if(audiobridge->spatial_audio) {
 				json_object_set_new(pl, "spatial_position", json_integer(p->spatial_position));
+				json_object_set_new(pl, "spatial_position_fb", json_integer(p->spatial_position_fb));
+			}
 			if(g_atomic_int_get(&p->suspended))
 				json_object_set_new(pl, "suspended", json_true());
 			json_array_append_new(list, pl);
@@ -5434,6 +5455,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		int opuserror = 0;
 		p->stereo = audiobridge->spatial_audio;
 		p->spatial_position = 50;
+		p->spatial_position_fb = 100;
 		p->decoder = opus_decoder_create(audiobridge->sampling_rate,
 			audiobridge->spatial_audio ? 2 : 1, &opuserror);
 		if(opuserror != OPUS_OK) {
@@ -6038,6 +6060,8 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 							json_object_set_new(pl, "talking", p->talking ? json_true() : json_false());
 						if(audiobridge->spatial_audio)
 							json_object_set_new(pl, "spatial_position", json_integer(p->spatial_position));
+						if(audiobridge->spatial_audio)
+							json_object_set_new(pl, "spatial_position_fb", json_integer(p->spatial_position_fb));
 						if(g_atomic_int_get(&p->suspended))
 							json_object_set_new(pl, "suspended", json_true());
 						json_array_append_new(list, pl);
@@ -6293,8 +6317,10 @@ void janus_audiobridge_setup_media(janus_plugin_session *handle) {
 		json_object_set_new(pl, "display", json_string(participant->display));
 	json_object_set_new(pl, "setup", json_true());
 	json_object_set_new(pl, "muted", participant->muted ? json_true() : json_false());
-	if(audiobridge->spatial_audio)
+	if(audiobridge->spatial_audio) {
 		json_object_set_new(pl, "spatial_position", json_integer(participant->spatial_position));
+		json_object_set_new(pl, "spatial_position_fb", json_integer(participant->spatial_position_fb));
+	}
 	if(g_atomic_int_get(&participant->suspended))
 		json_object_set_new(pl, "suspended", json_true());
 	json_array_append_new(list, pl);
@@ -6773,6 +6799,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *suspended = json_object_get(root, "suspended");
 			json_t *gain = json_object_get(root, "volume");
 			json_t *spatial = json_object_get(root, "spatial_position");
+			json_t *spatial_fb = json_object_get(root, "spatial_position_fb");
 			json_t *bitrate = json_object_get(root, "bitrate");
 			json_t *quality = json_object_get(root, "quality");
 			json_t *exploss = json_object_get(root, "expected_loss");
@@ -6785,6 +6812,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *gen_offer = json_object_get(root, "generate_offer");
 			int volume = gain ? json_integer_value(gain) : 100;
 			int spatial_position = spatial ? json_integer_value(spatial) : 50;
+			int spatial_position_fb = spatial_fb ? json_integer_value(spatial_fb) : 100;
 			int32_t opus_bitrate = audiobridge->default_bitrate;
 			if(bitrate) {
 				opus_bitrate = json_integer_value(bitrate);
@@ -6905,8 +6933,6 @@ static void *janus_audiobridge_handler(void *data) {
 				janus_audiobridge_plainrtp_media_cleanup(&participant->plainrtp_media);
 				janus_mutex_init(&participant->pmutex);
 				janus_mutex_init(&participant->rec_mutex);
-				janus_mutex_init(&participant->suspend_cond_mutex);
-				janus_condition_init(&participant->suspend_cond);
 			}
 			participant->session = session;
 			participant->room = audiobridge;
@@ -6933,7 +6959,10 @@ static void *janus_audiobridge_handler(void *data) {
 			if(participant->stereo) {
 				if(spatial_position > 100)
 					spatial_position = 100;
+				if(spatial_position_fb > 100)
+					spatial_position_fb = 100;
 				participant->spatial_position = spatial_position;
+				participant->spatial_position_fb = spatial_position_fb;
 			}
 			participant->user_audio_active_packets = json_integer_value(user_audio_active_packets);
 			participant->user_audio_level_average = json_integer_value(user_audio_level_average);
@@ -7184,6 +7213,8 @@ static void *janus_audiobridge_handler(void *data) {
 			json_object_set_new(pl, "muted", participant->muted ? json_true() : json_false());
 			if(audiobridge->spatial_audio)
 				json_object_set_new(pl, "spatial_position", json_integer(participant->spatial_position));
+			if(audiobridge->spatial_audio)
+				json_object_set_new(pl, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 			if(g_atomic_int_get(&participant->suspended))
 				json_object_set_new(pl, "suspended", json_true());
 			json_array_append_new(newuserlist, pl);
@@ -7219,6 +7250,8 @@ static void *janus_audiobridge_handler(void *data) {
 					json_object_set_new(pl, "talking", p->talking ? json_true() : json_false());
 				if(audiobridge->spatial_audio)
 					json_object_set_new(pl, "spatial_position", json_integer(p->spatial_position));
+				if(audiobridge->spatial_audio)
+					json_object_set_new(pl, "spatial_position_fb", json_integer(p->spatial_position_fb));
 				if(g_atomic_int_get(&participant->suspended))
 					json_object_set_new(pl, "suspended", json_true());
 				json_array_append_new(list, pl);
@@ -7250,6 +7283,8 @@ static void *janus_audiobridge_handler(void *data) {
 				json_object_set_new(info, "muted", participant->muted ? json_true() : json_false());
 				if(participant->stereo)
 					json_object_set_new(info, "spatial_position", json_integer(participant->spatial_position));
+				if(participant->stereo)
+					json_object_set_new(info, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 				if(g_atomic_int_get(&participant->suspended))
 					json_object_set_new(info, "suspended", json_true());
 				gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
@@ -7283,6 +7318,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *exploss = json_object_get(root, "expected_loss");
 			json_t *gain = json_object_get(root, "volume");
 			json_t *spatial = json_object_get(root, "spatial_position");
+			json_t *spatial_fb = json_object_get(root, "spatial_position_fb");
 			json_t *denoise = json_object_get(root, "denoise");
 			json_t *record = json_object_get(root, "record");
 			json_t *recfile = json_object_get(root, "filename");
@@ -7395,7 +7431,7 @@ static void *janus_audiobridge_handler(void *data) {
 				}
 				participant->group = group_id;
 			}
-			if(muted || display || (participant->stereo && spatial) || denoise) {
+			if(muted || display || (participant->stereo && (spatial || spatial_fb)) || denoise) {
 				if(muted) {
 					janus_mutex_lock(&participant->qmutex);
 					if(participant->muted != json_is_true(muted)) {
@@ -7416,11 +7452,19 @@ static void *janus_audiobridge_handler(void *data) {
 					JANUS_LOG(LOG_VERB, "Setting display property: %s (room %s, user %s)\n",
 						participant->display, participant->room->room_id_str, participant->user_id_str);
 				}
-				if(participant->stereo && spatial) {
-					int spatial_position = json_integer_value(spatial);
-					if(spatial_position > 100)
-						spatial_position = 100;
-					participant->spatial_position = spatial_position;
+				if(participant->stereo && (spatial || spatial_fb)) {
+					if(spatial) {
+						int spatial_position = json_integer_value(spatial);
+						if(spatial_position > 100)
+							spatial_position = 100;
+						participant->spatial_position = spatial_position;
+					}
+					if(spatial_fb) {
+						int spatial_position_fb = json_integer_value(spatial_fb);
+						if(spatial_position_fb > 100)
+							spatial_position_fb = 100;
+						participant->spatial_position_fb = spatial_position_fb;
+					}
 				}
 #ifdef HAVE_RNNOISE
 				if(denoise)
@@ -7445,6 +7489,8 @@ static void *janus_audiobridge_handler(void *data) {
 					json_object_set_new(pl, "muted", participant->muted ? json_true() : json_false());
 					if(audiobridge->spatial_audio)
 						json_object_set_new(pl, "spatial_position", json_integer(participant->spatial_position));
+					if(audiobridge->spatial_audio)
+						json_object_set_new(pl, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 					if(g_atomic_int_get(&participant->suspended))
 						json_object_set_new(pl, "suspended", json_true());
 					json_array_append_new(list, pl);
@@ -7520,6 +7566,8 @@ static void *janus_audiobridge_handler(void *data) {
 				json_object_set_new(info, "quality", json_integer(participant->opus_complexity));
 				if(participant->stereo)
 					json_object_set_new(info, "spatial_position", json_integer(participant->spatial_position));
+				if(participant->stereo)
+					json_object_set_new(info, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 				if(g_atomic_int_get(&participant->suspended))
 					json_object_set_new(info, "suspended", json_true());
 				gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
@@ -7659,12 +7707,14 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *suspended = json_object_get(root, "suspended");
 			json_t *gain = json_object_get(root, "volume");
 			json_t *spatial = json_object_get(root, "spatial_position");
+			json_t *spatial_fb = json_object_get(root, "spatial_position_fb");
 			json_t *bitrate = json_object_get(root, "bitrate");
 			json_t *quality = json_object_get(root, "quality");
 			json_t *exploss = json_object_get(root, "expected_loss");
 			json_t *denoise = json_object_get(root, "denoise");
 			int volume = gain ? json_integer_value(gain) : 100;
 			int spatial_position = spatial ? json_integer_value(spatial) : 50;
+			int spatial_position_fb = spatial_fb ? json_integer_value(spatial_fb) : 100;
 			int32_t opus_bitrate = audiobridge->default_bitrate;
 			if(bitrate) {
 				opus_bitrate = json_integer_value(bitrate);
@@ -7906,10 +7956,15 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->volume_gain = volume;
 			participant->stereo = audiobridge->spatial_audio;
 			participant->spatial_position = spatial_position;
+			participant->spatial_position_fb = spatial_position_fb;
 			if(participant->spatial_position < 0)
 				participant->spatial_position = 0;
 			else if(participant->spatial_position > 100)
 				participant->spatial_position = 100;
+			if(participant->spatial_position_fb < 0)
+				participant->spatial_position_fb = 0;
+			else if(participant->spatial_position_fb > 100)
+				participant->spatial_position_fb = 100;
 			participant->opus_bitrate = opus_bitrate;
 			if(participant->encoder)
 				opus_encoder_ctl(participant->encoder, OPUS_SET_BITRATE(participant->opus_bitrate ? participant->opus_bitrate : OPUS_AUTO));
@@ -7948,6 +8003,8 @@ static void *janus_audiobridge_handler(void *data) {
 			json_object_set_new(pl, "muted", participant->muted ? json_true() : json_false());
 			if(audiobridge->spatial_audio)
 				json_object_set_new(pl, "spatial_position", json_integer(participant->spatial_position));
+			if(audiobridge->spatial_audio)
+				json_object_set_new(pl, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 			if(g_atomic_int_get(&participant->suspended))
 				json_object_set_new(pl, "suspended", json_true());
 			json_array_append_new(newuserlist, pl);
@@ -7981,6 +8038,8 @@ static void *janus_audiobridge_handler(void *data) {
 					json_object_set_new(pl, "talking", p->talking ? json_true() : json_false());
 				if(audiobridge->spatial_audio)
 					json_object_set_new(pl, "spatial_position", json_integer(p->spatial_position));
+				if(audiobridge->spatial_audio)
+					json_object_set_new(pl, "spatial_position_fb", json_integer(p->spatial_position_fb));
 				if(g_atomic_int_get(&participant->suspended))
 					json_object_set_new(pl, "suspended", json_true());
 				json_array_append_new(list, pl);
@@ -8003,6 +8062,8 @@ static void *janus_audiobridge_handler(void *data) {
 				json_object_set_new(info, "muted", participant->muted ? json_true() : json_false());
 				if(participant->stereo)
 					json_object_set_new(info, "spatial_position", json_integer(participant->spatial_position));
+				if(participant->stereo)
+					json_object_set_new(info, "spatial_position_fb", json_integer(participant->spatial_position_fb));
 				if(g_atomic_int_get(&participant->suspended))
 					json_object_set_new(info, "suspended", json_true());
 				gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
@@ -8544,7 +8605,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 	/* Loop */
 	int i=0;
 	int count = 0, rf_count = 0, pf_count = 0, prev_count = 0;
-	int lgain = 0, rgain = 0, diff = 0;
+	int lgain = 0, rgain = 0, diff = 0, fgain = 100, lmixgain = 0, rmixgain = 0, rearmix = 0;
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&audiobridge->destroyed)) {
 		/* See if it's time to prepare a frame */
 		gettimeofday(&now, NULL);
@@ -8656,33 +8717,38 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 						diff = 50 - p->spatial_position;
 						lgain = 50 + diff;
 						rgain = 50 - diff;
+						fgain = 40 + (p->spatial_position_fb*60)/100;
+						rearmix = ((100 - p->spatial_position_fb) * 70) / 100;
+						lmixgain = (lgain*fgain)/100;
+						rmixgain = (rgain*fgain)/100;
 						for(i=0; i<samples; i++) {
+							opus_int16 spatial_sample = janus_audiobridge_rear_tone(curBuffer[i], curBuffer, i, rearmix);
 							if(i%2 == 0) {
-								if(lgain == 100) {
+								if(lmixgain == 100) {
 									if(p->volume_gain == 100) {
-										buffer[i] += curBuffer[i];
+										buffer[i] += spatial_sample;
 									} else {
-										buffer[i] += (curBuffer[i]*p->volume_gain)/100;
+										buffer[i] += (spatial_sample*p->volume_gain)/100;
 									}
 								} else {
 									if(p->volume_gain == 100) {
-										buffer[i] += (curBuffer[i]*lgain)/100;
+										buffer[i] += (spatial_sample*lmixgain)/100;
 									} else {
-										buffer[i] += (((curBuffer[i]*lgain)/100)*p->volume_gain)/100;
+										buffer[i] += (((spatial_sample*lmixgain)/100)*p->volume_gain)/100;
 									}
 								}
 							} else {
-								if(rgain == 100) {
+								if(rmixgain == 100) {
 									if(p->volume_gain == 100) {
-										buffer[i] += curBuffer[i];
+										buffer[i] += spatial_sample;
 									} else {
-										buffer[i] += (curBuffer[i]*p->volume_gain)/100;
+										buffer[i] += (spatial_sample*p->volume_gain)/100;
 									}
 								} else {
 									if(p->volume_gain == 100) {
-										buffer[i] += (curBuffer[i]*rgain)/100;
+										buffer[i] += (spatial_sample*rmixgain)/100;
 									} else {
-										buffer[i] += (((curBuffer[i]*rgain)/100)*p->volume_gain)/100;
+										buffer[i] += (((spatial_sample*rmixgain)/100)*p->volume_gain)/100;
 									}
 								}
 							}
@@ -8703,33 +8769,38 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 						diff = 50 - p->spatial_position;
 						lgain = 50 + diff;
 						rgain = 50 - diff;
+						fgain = 40 + (p->spatial_position_fb*60)/100;
+						rearmix = ((100 - p->spatial_position_fb) * 70) / 100;
+						lmixgain = (lgain*fgain)/100;
+						rmixgain = (rgain*fgain)/100;
 						for(i=0; i<samples; i++) {
+							opus_int16 spatial_sample = janus_audiobridge_rear_tone(curBuffer[i], curBuffer, i, rearmix);
 							if(i%2 == 0) {
-								if(lgain == 100) {
+								if(lmixgain == 100) {
 									if(p->volume_gain == 100) {
-										*(groupBuffers + index*samples + i) += curBuffer[i];
+										*(groupBuffers + index*samples + i) += spatial_sample;
 									} else {
-										*(groupBuffers + index*samples + i) += (curBuffer[i]*p->volume_gain)/100;
+										*(groupBuffers + index*samples + i) += (spatial_sample*p->volume_gain)/100;
 									}
 								} else {
 									if(p->volume_gain == 100) {
-										*(groupBuffers + index*samples + i) += (curBuffer[i]*lgain)/100;
+										*(groupBuffers + index*samples + i) += (spatial_sample*lmixgain)/100;
 									} else {
-										*(groupBuffers + index*samples + i) += (((curBuffer[i]*lgain)/100)*p->volume_gain)/100;
+										*(groupBuffers + index*samples + i) += (((spatial_sample*lmixgain)/100)*p->volume_gain)/100;
 									}
 								}
 							} else {
-								if(rgain == 100) {
+								if(rmixgain == 100) {
 									if(p->volume_gain == 100) {
-										*(groupBuffers + index*samples + i) += curBuffer[i];
+										*(groupBuffers + index*samples + i) += spatial_sample;
 									} else {
-										*(groupBuffers + index*samples + i) += (curBuffer[i]*p->volume_gain)/100;
+										*(groupBuffers + index*samples + i) += (spatial_sample*p->volume_gain)/100;
 									}
 								} else {
 									if(p->volume_gain == 100) {
-										*(groupBuffers + index*samples + i) += (curBuffer[i]*rgain)/100;
+										*(groupBuffers + index*samples + i) += (spatial_sample*rmixgain)/100;
 									} else {
-										*(groupBuffers + index*samples + i) += (((curBuffer[i]*rgain)/100)*p->volume_gain)/100;
+										*(groupBuffers + index*samples + i) += (((spatial_sample*rmixgain)/100)*p->volume_gain)/100;
 									}
 								}
 							}
@@ -8893,18 +8964,23 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 				diff = 50 - p->spatial_position;
 				lgain = 50 + diff;
 				rgain = 50 - diff;
+				fgain = 40 + (p->spatial_position_fb*60)/100;
+				rearmix = ((100 - p->spatial_position_fb) * 70) / 100;
+				lmixgain = (lgain*fgain)/100;
+				rmixgain = (rgain*fgain)/100;
 				for(i=0; i<samples; i++) {
+					int spatial_sample = curBuffer ? janus_audiobridge_rear_tone(curBuffer[i], curBuffer, i, rearmix) : 0;
 					if(i%2 == 0) {
-						if(lgain == 100) {
-							sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]) : 0);
+						if(lmixgain == 100) {
+							sumBuffer[i] = buffer[i] - spatial_sample;
 						} else {
-							sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]*lgain)/100 : 0);
+							sumBuffer[i] = buffer[i] - (spatial_sample*lmixgain)/100;
 						}
 					} else {
-						if(rgain == 100) {
-							sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]) : 0);
+						if(rmixgain == 100) {
+							sumBuffer[i] = buffer[i] - spatial_sample;
 						} else {
-							sumBuffer[i] = buffer[i] - (curBuffer ? (curBuffer[i]*rgain)/100 : 0);
+							sumBuffer[i] = buffer[i] - (spatial_sample*rmixgain)/100;
 						}
 					}
 				}
