@@ -1275,6 +1275,7 @@ json_t *janus_audiobridge_handle_admin_message(json_t *message);
 void janus_audiobridge_setup_media(janus_plugin_session *handle);
 void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
 void janus_audiobridge_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+void janus_audiobridge_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet);
 void janus_audiobridge_hangup_media(janus_plugin_session *handle);
 void janus_audiobridge_destroy_session(janus_plugin_session *handle, int *error);
 json_t *janus_audiobridge_query_session(janus_plugin_session *handle);
@@ -1299,6 +1300,7 @@ static janus_plugin janus_audiobridge_plugin =
 		.setup_media = janus_audiobridge_setup_media,
 		.incoming_rtp = janus_audiobridge_incoming_rtp,
 		.incoming_rtcp = janus_audiobridge_incoming_rtcp,
+		.incoming_data = janus_audiobridge_incoming_data,
 		.hangup_media = janus_audiobridge_hangup_media,
 		.destroy_session = janus_audiobridge_destroy_session,
 		.query_session = janus_audiobridge_query_session,
@@ -6408,6 +6410,61 @@ void janus_audiobridge_incoming_rtcp(janus_plugin_session *handle, janus_plugin_
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* FIXME Should we care? */
+}
+
+void janus_audiobridge_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet) {
+	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	if(packet == NULL || packet->buffer == NULL || packet->length == 0 || packet->binary)
+		return;
+	janus_audiobridge_session *session = janus_audiobridge_lookup_session(handle);
+	if(!session || g_atomic_int_get(&session->destroyed))
+		return;
+	janus_audiobridge_participant *participant = (janus_audiobridge_participant *)session->participant;
+	if(!participant || !participant->stereo)
+		return;
+	/* Parse the SL WebRTC spatial data channel message.
+	 * Firestorm sends JSON with fields:
+	 *   "sp": {"x": int, "y": int, "z": int}  - avatar/speaker world position in centimetres
+	 *   "sh": {"x": int, "y": int, "z": int, "w": int} - avatar heading quaternion * 100
+	 *   "lp": {"x": int, "y": int, "z": int}  - listener (camera) world position in centimetres
+	 *   "lh": {"x": int, "y": int, "z": int, "w": int} - listener heading quaternion * 100
+	 * All positions are global world coordinates (meters * 100).
+	 * Standard OpenSim regions are 256 m wide. */
+	json_error_t error;
+	char *text = g_strndup(packet->buffer, packet->length);
+	json_t *root = json_loads(text, 0, &error);
+	g_free(text);
+	if(!root)
+		return;
+	json_t *sp = json_object_get(root, "sp");
+	if(sp && json_is_object(sp)) {
+		json_t *sp_x = json_object_get(sp, "x");
+		json_t *sp_y = json_object_get(sp, "y");
+		if(json_is_integer(sp_x) && json_is_integer(sp_y)) {
+			/* Convert from centimetres to in-region metres (256 m regions) */
+#define SL_REGION_SIZE_CM 25600
+			int x_cm = (int)(json_integer_value(sp_x) % SL_REGION_SIZE_CM);
+			int y_cm = (int)(json_integer_value(sp_y) % SL_REGION_SIZE_CM);
+			if(x_cm < 0) x_cm += SL_REGION_SIZE_CM;
+			if(y_cm < 0) y_cm += SL_REGION_SIZE_CM;
+			/* Map to Janus spatial_position range 0-100:
+			 *   X (East-West) → left-right: West(0) = 0, East(256m) = 100
+			 *   Y (North-South) → front-back: South(0) = 0, North(256m) = 100 */
+			int new_lr = (x_cm * 100) / SL_REGION_SIZE_CM;
+			int new_fb = (y_cm * 100) / SL_REGION_SIZE_CM;
+			if(new_lr < 0) new_lr = 0;
+			else if(new_lr > 100) new_lr = 100;
+			if(new_fb < 0) new_fb = 0;
+			else if(new_fb > 100) new_fb = 100;
+			participant->spatial_position = new_lr;
+			participant->spatial_position_fb = new_fb;
+			JANUS_LOG(LOG_HUGE, "[AudioBridge] Updated spatial position for participant %s: LR=%d FB=%d\n",
+				participant->user_id_str, new_lr, new_fb);
+#undef SL_REGION_SIZE_CM
+		}
+	}
+	json_decref(root);
 }
 
 static void janus_audiobridge_recorder_create(janus_audiobridge_participant *participant) {
